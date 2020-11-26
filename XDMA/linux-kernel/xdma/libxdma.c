@@ -32,14 +32,8 @@
 #include "libxdma.h"
 #include "libxdma_api.h"
 #include "cdev_sgdma.h"
-#include "xdma_thread.h"
-
 
 /* Module Parameters */
-static unsigned int poll_mode;
-module_param(poll_mode, uint, 0644);
-MODULE_PARM_DESC(poll_mode, "Set 1 for hw polling, default is 0 (interrupts)");
-
 static unsigned int interrupt_mode;
 module_param(interrupt_mode, uint, 0644);
 MODULE_PARM_DESC(interrupt_mode, "0 - Auto , 1 - MSI, 2 - Legacy, 3 - MSI-x");
@@ -528,12 +522,8 @@ static int xdma_engine_stop(struct xdma_engine *engine)
 	w |= (u32)XDMA_CTRL_IE_READ_ERROR;
 	w |= (u32)XDMA_CTRL_IE_DESC_ERROR;
 
-	if (poll_mode) {
-		w |= (u32)XDMA_CTRL_POLL_MODE_WB;
-	} else {
-		w |= (u32)XDMA_CTRL_IE_DESC_STOPPED;
-		w |= (u32)XDMA_CTRL_IE_DESC_COMPLETED;
-	}
+	w |= (u32)XDMA_CTRL_IE_DESC_STOPPED;
+	w |= (u32)XDMA_CTRL_IE_DESC_COMPLETED;
 
 	dbg_tfr("Stopping SG DMA %s engine; writing 0x%08x to 0x%p.\n",
 		engine->name, w, (u32 *)&engine->regs->control);
@@ -578,12 +568,9 @@ static int engine_start_mode_config(struct xdma_engine *engine)
 	w |= (u32)XDMA_CTRL_IE_DESC_ALIGN_MISMATCH;
 	w |= (u32)XDMA_CTRL_IE_MAGIC_STOPPED;
 
-	if (poll_mode) {
-		w |= (u32)XDMA_CTRL_POLL_MODE_WB;
-	} else {
-		w |= (u32)XDMA_CTRL_IE_DESC_STOPPED;
-		w |= (u32)XDMA_CTRL_IE_DESC_COMPLETED;
-	}
+	w |= (u32)XDMA_CTRL_IE_DESC_STOPPED;
+	w |= (u32)XDMA_CTRL_IE_DESC_COMPLETED;
+
 
 	/* set non-incremental addressing mode */
 	if (engine->non_incr_addr)
@@ -1061,74 +1048,7 @@ static int engine_ring_process(struct xdma_engine *engine)
 	return eop_count;
 }
 
-static int engine_service_cyclic_polled(struct xdma_engine *engine)
-{
-	int eop_count;
-	int rc = 0;
-	struct xdma_poll_wb *writeback_data;
-	u32 sched_limit = 0;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-
-	if (engine->magic != MAGIC_ENGINE) {
-		pr_err("%s has invalid magic number %lx\n", engine->name,
-		       engine->magic);
-		return -EINVAL;
-	}
-
-	eop_count = engine->eop_count;
-	writeback_data = (struct xdma_poll_wb *)engine->poll_mode_addr_virt;
-
-	while (eop_count == 0) {
-		if (sched_limit != 0) {
-			if ((sched_limit % NUM_POLLS_PER_SCHED) == 0)
-				schedule();
-		}
-		sched_limit++;
-
-		/* Monitor descriptor writeback address for errors */
-		if ((writeback_data->completed_desc_count) & WB_ERR_MASK) {
-			rc = -1;
-			break;
-		}
-
-		eop_count = engine_ring_process(engine);
-		if (eop_count < 0) {
-			pr_err("Failed to process engine ring\n");
-			return eop_count;
-		}
-	}
-
-	if (eop_count == 0) {
-		rc = engine_status_read(engine, 1, 0);
-		if (rc < 0) {
-			pr_err("Failed to read engine status\n");
-			return rc;
-		}
-		if ((engine->running) && !(engine->status & XDMA_STAT_BUSY)) {
-			/* transfers on queue? */
-			if (!list_empty(&engine->transfer_list)) {
-				rc = engine_transfer_dequeue(engine);
-				if (rc < 0) {
-					pr_err("Failed to dequeue transfer\n");
-					return rc;
-				}
-			}
-
-			rc = engine_service_shutdown(engine);
-			if (rc < 0) {
-				pr_err("Failed to shutdown engine\n");
-				return rc;
-			}
-		}
-	}
-	eop_count--;
-	engine->eop_count = eop_count;
-	return rc;
-}
 
 static int engine_service_cyclic_interrupt(struct xdma_engine *engine)
 {
@@ -1213,10 +1133,7 @@ static int engine_service_cyclic(struct xdma_engine *engine)
 		return -EINVAL;
 	}
 
-	if (poll_mode)
-		rc = engine_service_cyclic_polled(engine);
-	else
-		rc = engine_service_cyclic_interrupt(engine);
+	rc = engine_service_cyclic_interrupt(engine);
 
 	return rc;
 }
@@ -1270,22 +1187,16 @@ static int engine_service_resume(struct xdma_engine *engine)
  * @engine pointer to struct xdma_engine
  *
  */
-static int engine_service(struct xdma_engine *engine, int desc_writeback)
+static int engine_service(struct xdma_engine *engine)
 {
 	struct xdma_transfer *transfer = NULL;
-	u32 desc_count = desc_writeback & WB_COUNT_MASK;
-	u32 err_flag = desc_writeback & WB_ERR_MASK;
+	u32 desc_count = 0;
 	int rv = 0;
-	struct xdma_poll_wb *wb_data;
 
 	if (!engine) {
 		pr_err("dma engine NULL\n");
 		return -EINVAL;
 	}
-
-	/* If polling detected an error, signal to the caller */
-	if (err_flag)
-		rv = -1;
 
 	/* Service the engine */
 	if (!engine->running) {
@@ -1299,24 +1210,19 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 	}
 
 	/*
-	 * If called by the ISR or polling detected an error, read and clear
-	 * engine status. For polled mode descriptor completion, this read is
-	 * unnecessary and is skipped to reduce latency
+	 * Read and clear engine status.
 	 */
-	if ((desc_count == 0) || (err_flag != 0)) {
-		rv = engine_status_read(engine, 1, 0);
-		if (rv < 0) {
-			pr_err("Failed to read engine status\n");
-			return rv;
-		}
+	rv = engine_status_read(engine, 1, 0);
+	if (rv < 0) {
+		pr_err("Failed to read engine status\n");
+		return rv;
 	}
 
 	/*
 	 * engine was running but is no longer busy, or writeback occurred,
 	 * shut down
 	 */
-	if ((engine->running && !(engine->status & XDMA_STAT_BUSY)) ||
-	    (desc_count != 0)) {
+	if ((engine->running && !(engine->status & XDMA_STAT_BUSY))) {
 		rv = engine_service_shutdown(engine);
 		if (rv < 0) {
 			pr_err("Failed to shutdown engine\n");
@@ -1324,13 +1230,9 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 		}
 	}
 	/*
-	 * If called from the ISR, or if an error occurred, the descriptor
-	 * count will be zero.  In this scenario, read the descriptor count
-	 * from HW.  In polled mode descriptor completion, this read is
-	 * unnecessary and is skipped to reduce latency
+	 * Read the descriptor count from HW.
 	 */
-	if (!desc_count)
-		desc_count = read_register(&engine->regs->completed_desc_count);
+	desc_count = read_register(&engine->regs->completed_desc_count);
 	dbg_tfr("desc_count = %d\n", desc_count);
 
 	/* transfers on queue? */
@@ -1365,12 +1267,6 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 	 */
 	transfer = engine_service_final_transfer(engine, transfer, &desc_count);
 
-	/* Before starting engine again, clear the writeback data */
-	if (poll_mode) {
-		wb_data = (struct xdma_poll_wb *)engine->poll_mode_addr_virt;
-		wb_data->completed_desc_count = 0;
-	}
-
 	/* Restart the engine following the servicing */
 	rv = engine_service_resume(engine);
 	if (rv < 0)
@@ -1404,7 +1300,7 @@ static void engine_service_work(struct work_struct *work)
 			goto unlock;
 		}
 	} else {
-		rv = engine_service(engine, 0);
+		rv = engine_service(engine);
 		if (rv < 0) {
 			pr_err("Failed to service engine\n");
 			goto unlock;
@@ -1424,108 +1320,6 @@ static void engine_service_work(struct work_struct *work)
 	/* unlock the engine */
 unlock:
 	spin_unlock_irqrestore(&engine->lock, flags);
-}
-
-static u32 engine_service_wb_monitor(struct xdma_engine *engine,
-				     u32 expected_wb)
-{
-	struct xdma_poll_wb *wb_data;
-	u32 desc_wb = 0;
-	u32 sched_limit = 0;
-	unsigned long timeout;
-
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-	wb_data = (struct xdma_poll_wb *)engine->poll_mode_addr_virt;
-
-	/*
-	 * Poll the writeback location for the expected number of
-	 * descriptors / error events This loop is skipped for cyclic mode,
-	 * where the expected_desc_count passed in is zero, since it cannot be
-	 * determined before the function is called
-	 */
-
-	timeout = jiffies + (POLL_TIMEOUT_SECONDS * HZ);
-	while (expected_wb != 0) {
-		desc_wb = wb_data->completed_desc_count;
-
-		if (desc_wb & WB_ERR_MASK)
-			break;
-		else if (desc_wb >= expected_wb)
-			break;
-
-		/* prevent system from hanging in polled mode */
-		if (time_after(jiffies, timeout)) {
-			dbg_tfr("Polling timeout occurred");
-			dbg_tfr("desc_wb = 0x%08x, expected 0x%08x\n", desc_wb,
-				expected_wb);
-			if ((desc_wb & WB_COUNT_MASK) > expected_wb)
-				desc_wb = expected_wb | WB_ERR_MASK;
-
-			break;
-		}
-
-		/*
-		 * Define NUM_POLLS_PER_SCHED to limit how much time is spent
-		 * in the scheduler
-		 */
-
-		if (sched_limit != 0) {
-			if ((sched_limit % NUM_POLLS_PER_SCHED) == 0)
-				schedule();
-		}
-		sched_limit++;
-	}
-
-	return desc_wb;
-}
-
-int engine_service_poll(struct xdma_engine *engine,
-			       u32 expected_desc_count)
-{
-	struct xdma_poll_wb *writeback_data;
-	u32 desc_wb = 0;
-	unsigned long flags;
-	int rv = 0;
-
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-
-	if (engine->magic != MAGIC_ENGINE) {
-		pr_err("%s has invalid magic number %lx\n", engine->name,
-		       engine->magic);
-		return -EINVAL;
-	}
-
-	writeback_data = (struct xdma_poll_wb *)engine->poll_mode_addr_virt;
-
-	if ((expected_desc_count & WB_COUNT_MASK) != expected_desc_count) {
-		dbg_tfr("Queued descriptor count is larger than supported\n");
-		return -1;
-	}
-
-	/*
-	 * Poll the writeback location for the expected number of
-	 * descriptors / error events This loop is skipped for cyclic mode,
-	 * where the expected_desc_count passed in is zero, since it cannot be
-	 * determined before the function is called
-	 */
-
-	desc_wb = engine_service_wb_monitor(engine, expected_desc_count);
-
-	spin_lock_irqsave(&engine->lock, flags);
-	dbg_tfr("%s service.\n", engine->name);
-	if (engine->cyclic_req)
-		rv = engine_service_cyclic(engine);
-	else
-		rv = engine_service(engine, desc_wb);
-	spin_unlock_irqrestore(&engine->lock, flags);
-
-	return rv;
 }
 
 static irqreturn_t user_irq_service(int irq, struct xdma_user_irq *user_irq)
@@ -2771,16 +2565,6 @@ static void engine_free_resource(struct xdma_engine *engine)
 {
 	struct xdma_dev *xdev = engine->xdev;
 
-	/* Release memory use for descriptor writebacks */
-	if (engine->poll_mode_addr_virt) {
-		dbg_sg("Releasing memory for descriptor writeback\n");
-		dma_free_coherent(&xdev->pdev->dev, sizeof(struct xdma_poll_wb),
-				  engine->poll_mode_addr_virt,
-				  engine->poll_mode_bus);
-		dbg_sg("Released memory for descriptor writeback\n");
-		engine->poll_mode_addr_virt = NULL;
-	}
-
 	if (engine->desc) {
 		dbg_init("device %s, engine %s pre-alloc desc 0x%p,0x%llx.\n",
 			 dev_name(&xdev->pdev->dev), engine->name, engine->desc,
@@ -2829,9 +2613,6 @@ static int engine_destroy(struct xdma_dev *xdev, struct xdma_engine *engine)
 				    (0x6 * TARGET_SPACING));
 		write_register(reg_value, &reg->credit_mode_enable_w1c, 0);
 	}
-
-	if (poll_mode)
-		xdma_thread_remove_work(engine);
 
 	/* Release memory use for descriptor writebacks */
 	engine_free_resource(engine);
@@ -2893,44 +2674,6 @@ struct xdma_transfer *engine_cyclic_stop(struct xdma_engine *engine)
 	return transfer;
 }
 
-static int engine_writeback_setup(struct xdma_engine *engine)
-{
-	u32 w;
-	struct xdma_dev *xdev;
-	struct xdma_poll_wb *writeback;
-
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-
-	xdev = engine->xdev;
-	if (!xdev) {
-		pr_err("Invalid xdev\n");
-		return -EINVAL;
-	}
-
-	/*
-	 * better to allocate one page for the whole device during probe()
-	 * and set per-engine offsets here
-	 */
-	writeback = (struct xdma_poll_wb *)engine->poll_mode_addr_virt;
-	writeback->completed_desc_count = 0;
-
-	dbg_init("Setting writeback location to 0x%llx for engine %p",
-		 engine->poll_mode_bus, engine);
-	w = cpu_to_le32(PCI_DMA_L(engine->poll_mode_bus));
-	write_register(w, &engine->regs->poll_mode_wb_lo,
-		       (unsigned long)(&engine->regs->poll_mode_wb_lo) -
-			       (unsigned long)(&engine->regs));
-	w = cpu_to_le32(PCI_DMA_H(engine->poll_mode_bus));
-	write_register(w, &engine->regs->poll_mode_wb_hi,
-		       (unsigned long)(&engine->regs->poll_mode_wb_hi) -
-			       (unsigned long)(&engine->regs));
-
-	return 0;
-}
-
 /* engine_create() - Create an SG DMA engine bookkeeping data structure
  *
  * An SG DMA engine consists of the resources for a single-direction transfer
@@ -2945,7 +2688,6 @@ static int engine_writeback_setup(struct xdma_engine *engine)
 static int engine_init_regs(struct xdma_engine *engine)
 {
 	u32 reg_value;
-	int rv = 0;
 
 	write_register(XDMA_CTRL_NON_INCR_ADDR, &engine->regs->control_w1c,
 		       (unsigned long)(&engine->regs->control_w1c) -
@@ -2960,19 +2702,9 @@ static int engine_init_regs(struct xdma_engine *engine)
 	reg_value |= XDMA_CTRL_IE_READ_ERROR;
 	reg_value |= XDMA_CTRL_IE_DESC_ERROR;
 
-	/* if using polled mode, configure writeback address */
-	if (poll_mode) {
-		rv = engine_writeback_setup(engine);
-		if (rv) {
-			dbg_init("%s descr writeback setup failed.\n",
-				 engine->name);
-			goto fail_wb;
-		}
-	} else {
-		/* enable the relevant completion interrupts */
-		reg_value |= XDMA_CTRL_IE_DESC_STOPPED;
-		reg_value |= XDMA_CTRL_IE_DESC_COMPLETED;
-	}
+	/* enable the relevant completion interrupts */
+	reg_value |= XDMA_CTRL_IE_DESC_STOPPED;
+	reg_value |= XDMA_CTRL_IE_DESC_COMPLETED;
 
 	/* Apply engine configurations */
 	write_register(reg_value, &engine->regs->interrupt_enable_mask,
@@ -2995,9 +2727,6 @@ static int engine_init_regs(struct xdma_engine *engine)
 	}
 
 	return 0;
-
-fail_wb:
-	return rv;
 }
 
 static int engine_alloc_resource(struct xdma_engine *engine)
@@ -3012,18 +2741,6 @@ static int engine_alloc_resource(struct xdma_engine *engine)
 		pr_warn("dev %s, %s pre-alloc desc OOM.\n",
 			dev_name(&xdev->pdev->dev), engine->name);
 		goto err_out;
-	}
-
-	if (poll_mode) {
-		engine->poll_mode_addr_virt =
-			dma_alloc_coherent(&xdev->pdev->dev,
-					   sizeof(struct xdma_poll_wb),
-					   &engine->poll_mode_bus, GFP_KERNEL);
-		if (!engine->poll_mode_addr_virt) {
-			pr_warn("%s, %s poll pre-alloc writeback OOM.\n",
-				dev_name(&xdev->pdev->dev), engine->name);
-			goto err_out;
-		}
 	}
 
 	if (engine->streaming && engine->dir == DMA_FROM_DEVICE) {
@@ -3099,9 +2816,6 @@ static int engine_init(struct xdma_engine *engine, struct xdma_dev *xdev,
 	rv = engine_init_regs(engine);
 	if (rv)
 		return rv;
-
-	if (poll_mode)
-		xdma_thread_add_work(engine);
 
 	return 0;
 }
@@ -3533,31 +3247,10 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 			goto unmap_sgl;
 		}
 
-		/*
-		 * When polling, determine how many descriptors have been queued
-		 * on the engine to determine the writeback value expected
-		 */
-		if (poll_mode) {
-			unsigned int desc_count;
-
-			spin_lock_irqsave(&engine->lock, flags);
-			desc_count = xfer->desc_num;
-			spin_unlock_irqrestore(&engine->lock, flags);
-			dbg_tfr("%s poll desc_count=%d\n", engine->name,
-				desc_count);
-			rv = engine_service_poll(engine, desc_count);
-			if (rv < 0) {
-				mutex_unlock(&engine->desc_lock);
-				pr_err("Failed to service polling\n");
-				goto unmap_sgl;
-			}
-
-		} else {
-			xlx_wait_event_interruptible_timeout(
-				xfer->wq,
-				(xfer->state != TRANSFER_STATE_SUBMITTED),
-				msecs_to_jiffies(timeout_ms));
-		}
+		xlx_wait_event_interruptible_timeout(
+			xfer->wq,
+			(xfer->state != TRANSFER_STATE_SUBMITTED),
+			msecs_to_jiffies(timeout_ms));
 
 		spin_lock_irqsave(&engine->lock, flags);
 
@@ -4437,8 +4130,7 @@ void *xdma_device_open(const char *mname, struct pci_dev *pdev, int *user_max,
 	if (rv < 0)
 		goto err_msix;
 
-	if (!poll_mode)
-		channel_interrupts_enable(xdev, ~0);
+	channel_interrupts_enable(xdev, ~0);
 
 	/* Flush writes */
 	read_interrupts(xdev);
@@ -4605,13 +4297,11 @@ void xdma_device_online(struct pci_dev *pdev, void *dev_hndl)
 	}
 
 	/* re-write the interrupt table */
-	if (!poll_mode) {
-		irq_setup(xdev, pdev);
+	irq_setup(xdev, pdev);
 
-		channel_interrupts_enable(xdev, ~0);
-		user_interrupts_enable(xdev, xdev->mask_irq_user);
-		read_interrupts(xdev);
-	}
+	channel_interrupts_enable(xdev, ~0);
+	user_interrupts_enable(xdev, xdev->mask_irq_user);
+	read_interrupts(xdev);
 
 	xdma_device_flag_clear(xdev, XDEV_FLAG_OFFLINE);
 	pr_info("xdev 0x%p, done.\n", xdev);
@@ -4704,75 +4394,58 @@ static void xdma_transfer_cyclic(struct xdma_transfer *transfer)
 
 static int transfer_monitor_cyclic(struct xdma_engine *engine,
 				   struct xdma_transfer *transfer,
-				   int timeout_ms)
-{
-	struct xdma_result *result;
-	int rc = 0;
+				   int timeout_ms) {
+    struct xdma_result *result;
+    int rc = 0;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
+    if (!engine) {
+        pr_err("dma engine NULL\n");
+        return -EINVAL;
+    }
 
-	if (!transfer) {
-		pr_err("%s: xfer empty.\n", engine->name);
-		return -EINVAL;
-	}
+    if (!transfer) {
+        pr_err("%s: xfer empty.\n", engine->name);
+        return -EINVAL;
+    }
 
-	result = engine->cyclic_result;
-	if (!result) {
-		pr_err("%s Cyclic transfer resources not available.\n",
-		       engine->name);
-		return -EINVAL;
-	}
+    result = engine->cyclic_result;
+    if (!result) {
+        pr_err("%s Cyclic transfer resources not available.\n",
+               engine->name);
+        return -EINVAL;
+    }
 
-	if (poll_mode) {
-		int i;
+    if (enable_credit_mp) {
+        dbg_tfr("%s: rx_head=%d,rx_tail=%d, wait ...\n",
+                engine->name, engine->rx_head, engine->rx_tail);
 
-		for (i = 0; i < 5; i++) {
-			rc = engine_service_poll(engine, 0);
-			if (rc) {
-				pr_info("%s service_poll failed %d.\n",
-					engine->name, rc);
-				rc = -ERESTARTSYS;
-			}
-			if (result[engine->rx_head].status) {
-				rc = 0;
-				break;
-			}
-		}
-	} else {
-		if (enable_credit_mp) {
-			dbg_tfr("%s: rx_head=%d,rx_tail=%d, wait ...\n",
-				engine->name, engine->rx_head, engine->rx_tail);
+        rc = xlx_wait_event_interruptible_timeout(
+                transfer->wq,
+                (engine->rx_head != engine->rx_tail ||
+                 engine->rx_overrun),
+                msecs_to_jiffies(timeout_ms));
 
-			rc = xlx_wait_event_interruptible_timeout(
-				transfer->wq,
-				(engine->rx_head != engine->rx_tail ||
-				 engine->rx_overrun),
-				msecs_to_jiffies(timeout_ms));
+        dbg_tfr("%s: wait returns %d, rx %d/%d, overrun %d.\n",
+                engine->name, rc, engine->rx_head,
+                engine->rx_tail, engine->rx_overrun);
+    } else {
+        rc = xlx_wait_event_interruptible_timeout(
+                transfer->wq,
+                engine->eop_found,
+                msecs_to_jiffies(timeout_ms));
 
-			dbg_tfr("%s: wait returns %d, rx %d/%d, overrun %d.\n",
-				engine->name, rc, engine->rx_head,
-				engine->rx_tail, engine->rx_overrun);
-		} else {
-			rc = xlx_wait_event_interruptible_timeout(
-				transfer->wq,
-				engine->eop_found,
-				msecs_to_jiffies(timeout_ms));
+        dbg_tfr("%s: wait returns %d, eop_found %d.\n",
+                engine->name, rc, engine->eop_found);
+    }
+    /* condition evaluated to false after the timeout elapsed */
+    if (rc == 0)
+        rc = -ETIME;
+        /* condition evaluated to true */
+    else if (rc > 0)
+        rc = 0;
 
-			dbg_tfr("%s: wait returns %d, eop_found %d.\n",
-				engine->name, rc, engine->eop_found);
-		}
-		/* condition evaluated to false after the timeout elapsed */
-		if (rc == 0)
-			rc = -ETIME;
-		/* condition evaluated to true */
-		else if (rc > 0)
-			rc = 0;
-	}
 
-	return rc;
+    return rc;
 }
 
 static struct scatterlist *sglist_index(struct sg_table *sgt, unsigned int idx)
@@ -5191,51 +4864,6 @@ err_out:
 	return rc;
 }
 
-static int cyclic_shutdown_polled(struct xdma_engine *engine)
-{
-	int rv;
-
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-
-	spin_lock(&engine->lock);
-
-	dbg_tfr("Polling for shutdown completion\n");
-	do {
-		rv = engine_status_read(engine, 1, 0);
-		if (rv < 0) {
-			pr_err("Failed to read engine status\n");
-			goto failure;
-		}
-		schedule();
-	} while (engine->status & XDMA_STAT_BUSY);
-
-	if ((engine->running) && !(engine->status & XDMA_STAT_BUSY)) {
-		dbg_tfr("Engine has stopped\n");
-
-		if (!list_empty(&engine->transfer_list)) {
-			rv = engine_transfer_dequeue(engine);
-			if (rv < 0) {
-				pr_err("Failed to dequeue transfer\n");
-				goto failure;
-			}
-		}
-
-		rv = engine_service_shutdown(engine);
-		if (rv < 0) {
-			pr_err("Failed to shutdown engine\n");
-			goto failure;
-		}
-	}
-failure:
-	dbg_tfr("Shutdown completion polling done\n");
-	spin_unlock(&engine->lock);
-
-	return rv;
-}
-
 static int cyclic_shutdown_interrupt(struct xdma_engine *engine)
 {
 	int rc;
@@ -5290,10 +4918,7 @@ int xdma_cyclic_transfer_teardown(struct xdma_engine *engine)
 	spin_unlock_irqrestore(&engine->lock, flags);
 
 	/* wait for engine to be no longer running */
-	if (poll_mode)
-		rc = cyclic_shutdown_polled(engine);
-	else
-		rc = cyclic_shutdown_interrupt(engine);
+    rc = cyclic_shutdown_interrupt(engine);
 
 	if (rc < 0) {
 		pr_err("Failed to shutdown cyclic transfers\n");

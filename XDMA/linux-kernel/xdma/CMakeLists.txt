@@ -29,7 +29,7 @@ set(KERNELHEADERS_INCLUDE_DIRS
 
 # find MODULE_LICENSE("GPL"), MODULE_AUTHOR() etc.
 # thanks to "merseyviking" from stack overflow
-add_definitions(-D__KERNEL__ -DMODULE -DKBUILD_MODNAME="xdma_mod")
+add_definitions(-D__KERNEL__ -DMODULE -DKBUILD_MODNAME="xdma_mod" -D__LIBXDMA_DEBUG__)
 
 include_directories(${KERNELHEADERS_INCLUDE_DIRS})
 
@@ -40,7 +40,7 @@ set(DRIVER_FILE xdma_mod.ko)
 set(KBUILD_CMD $(MAKE) ARCH=arm64 CROSS_COMPILE=${CROSS_COMPILE} -C ${KERNELHEADERS_DIR} modules M=${CMAKE_CURRENT_BINARY_DIR} src=${CMAKE_CURRENT_SOURCE_DIR})
 
 # Generate the Kbuild file through cmake.
-FILE(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/Kbuild "xdma-objs := libxdma.o xdma_cdev.o cdev_ctrl.o cdev_events.o cdev_sgdma.o cdev_xvc.o cdev_bypass.o xdma_mod.o xdma_thread.o
+FILE(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/Kbuild "xdma-objs := libxdma.o xdma_cdev.o cdev_ctrl.o cdev_events.o cdev_sgdma.o cdev_xvc.o cdev_bypass.o xdma_mod.o
  obj-m := xdma.o")
 
 add_custom_command(OUTPUT ${DRIVER_FILE}
@@ -51,8 +51,9 @@ add_custom_command(OUTPUT ${DRIVER_FILE}
 
 add_custom_target(driver ALL DEPENDS ${DRIVER_FILE})
 
+add_definitions(-include "../../../../../kernel-out/source/include/linux/kconfig.h")
+
 add_library(dummy_target
-		../../../../../kernel-out/source/include/linux/kconfig.h
 	cdev_bypass.c
 	cdev_ctrl.c	cdev_ctrl.h
 	cdev_events.c
@@ -62,6 +63,5 @@ add_library(dummy_target
 	version.h
 	xdma_cdev.c	xdma_cdev.h
 	xdma_mod.c	xdma_mod.c
-	xdma_thread.c	xdma_thread.h
 	)
 

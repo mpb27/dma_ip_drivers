@@ -385,14 +385,6 @@ struct sgdma_common_regs {
 	u32 credit_mode_enable_w1c;
 } __packed;
 
-
-/* Structure for polled mode descriptor writeback */
-struct xdma_poll_wb {
-	u32 completed_desc_count;
-	u32 reserved_1[7];
-} __packed;
-
-
 /**
  * Descriptor for a single contiguous memory block transfer.
  *
@@ -522,10 +514,6 @@ struct xdma_engine {
 	/* for copy from cyclic buffer to user buffer */
 	unsigned int user_buffer_index;
 
-	/* Members associated with polled mode support */
-	u8 *poll_mode_addr_virt;	/* virt addr for descriptor writeback */
-	dma_addr_t poll_mode_bus;	/* bus addr for descriptor writeback */
-
 	/* Members associated with interrupt mode support */
 #if	HAS_SWAKE_UP
 	struct swait_queue_head shutdown_wq;
@@ -551,13 +539,6 @@ struct xdma_engine {
 #else
 	wait_queue_head_t xdma_perf_wq;	/* Perf test sync */
 #endif
-
-	struct xdma_kthread *cmplthp;
-	/* completion status thread list for the queue */
-	struct list_head cmplthp_list;
-	/* pending work thread list */
-	/* cpu attached to intr_work */
-	unsigned int intr_work_cpu;
 };
 
 struct xdma_user_irq {
@@ -686,5 +667,4 @@ int xdma_cyclic_transfer_teardown(struct xdma_engine *engine);
 ssize_t xdma_engine_read_cyclic(struct xdma_engine *engine,
 		char __user *buf, size_t count, int timeout_ms);
 int engine_addrmode_set(struct xdma_engine *engine, unsigned long arg);
-int engine_service_poll(struct xdma_engine *engine, u32 expected_desc_count);
 #endif /* XDMA_LIB_H */

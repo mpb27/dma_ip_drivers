@@ -33,7 +33,6 @@
 #include "libxdma_api.h"
 #include "xdma_cdev.h"
 #include "cdev_sgdma.h"
-#include "xdma_thread.h"
 
 /* Module Parameters */
 unsigned int sgdma_timeout = 10;
@@ -473,9 +472,6 @@ static ssize_t cdev_aio_write(struct kiocb *iocb, const struct iovec *io,
 					0, sgdma_timeout * 1000);
 	}
 
-	if (engine->cmplthp)
-		xdma_kthread_wakeup(engine->cmplthp);
-
 	return -EIOCBQUEUED;
 }
 
@@ -547,9 +543,6 @@ static ssize_t cdev_aio_read(struct kiocb *iocb, const struct iovec *io,
 					caio->cb[i].ep_addr, &caio->cb[i].sgt,
 					0, sgdma_timeout * 1000);
 	}
-
-	if (engine->cmplthp)
-		xdma_kthread_wakeup(engine->cmplthp);
 
 	return -EIOCBQUEUED;
 }
